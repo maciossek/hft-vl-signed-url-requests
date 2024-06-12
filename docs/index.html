@@ -566,48 +566,38 @@
           <h3>s3-cloudformation.yml</h3>
           <pre><code class="yaml" data-trim data-noescape data-line-numbers><script type="text/template">
             AWSTemplateFormatVersion: "2010-09-09"
-            Description: S3 Bucket for crap-stories
-            Resources:
-              S3Bucket:
-                Type: AWS::S3::Bucket
-                Properties:
-                  AccessControl: PublicRead
-                  BucketName: "hft-crap-stories"
-                  CorsConfiguration:
-                    CorsRules:
-                      - AllowedHeaders:
-                          - "*"
-                        AllowedMethods:
-                          - GET
-                          - HEAD
-                          - PUT
-                          - POST
-                        AllowedOrigins:
-                          - "*"
-                DeletionPolicy: Retain
+            Description: CloudFormation template to create a public S3 bucket with no CORS configuration.
 
-              S3BucketPolicy:
+            Resources:
+              PublicS3Bucket:
+                Type: "AWS::S3::Bucket"
+                Properties:
+                  BucketName: "crap-stories-2024"
+                  PublicAccessBlockConfiguration:
+                    BlockPublicAcls: true
+                    IgnorePublicAcls: true
+                    BlockPublicPolicy: false
+                    RestrictPublicBuckets: false
+
+              MyBucketPolicy:
                 Type: "AWS::S3::BucketPolicy"
                 Properties:
-                  Bucket: !Ref S3Bucket
+                  Bucket: !Ref PublicS3Bucket
                   PolicyDocument:
+                    Version: "2012-10-17"
                     Statement:
-                      - Action:
-                          - "s3:GetObject"
-                        Effect: Allow
+                      - Effect: Allow
                         Principal: "*"
-                        Resource:
-                          - !Join
-                            - "/"
-                            - - !GetAtt S3Bucket.Arn
-                              - "*"
+                        Action: "s3:GetObject"
+                        Resource: !Sub "arn:aws:s3:::${PublicS3Bucket}/*"
 
             Outputs:
-              BucketARN:
-                Description: S3 Bucket Amazon Resource Name
-                Value: !GetAtt S3Bucket.Arn
+              BucketName:
+                Description: "Name of the S3 bucket"
+                Value: !Ref PublicS3Bucket
                 Export:
-                  Name: !Sub ${AWS::StackName}-BucketARN
+                  Name: "PublicS3BucketName"
+
 
           </script></code></pre>
         </section>
@@ -620,17 +610,15 @@
         <section data-auto-animate>
           <h3>aws.js</h3>
           <pre><code class="js" data-trim data-noescape data-line-numbers><script type="text/template">
-            import AWS from "aws-sdk";
+            import { S3Client } from "@aws-sdk/client-s3";
             import env from "./env";
-
-            AWS.config = new AWS.Config({
-              accessKeyId: env.awsAccessKeyId,
-              secretAccessKey: env.awsSecretAccessKey,
+            
+            export const s3Client = new S3Client({
               region: "eu-central-1",
+              credentials: { accessKeyId: env.awsAccessKeyId, secretAccessKey: env.awsSecretAccessKey, region: "eu-central-1" },
               signatureVersion: "v4",
             });
-
-            export const s3 = new AWS.S3();
+            
           </script></code></pre>
         </section>
         <section data-auto-animate>
@@ -679,106 +667,42 @@
         <section data-auto-animate>
           <h3>signedRequest.graphql</h3>
           <pre><code class="graphql" data-trim data-noescape data-line-numbers><script type="text/template">
-            type SignedUrlResult {
-              success: Boolean!
-              errors: [String]
-              signedUrl: String
-            }
-            
             input SignedUrlInput {
               fileType: String!
             }
             
             type Query {
-              generateUrl(input: SignedUrlInput!): SignedUrlResult! @isAuthenticated
+              generateUrl(input: SignedUrlInput!): String! @isAuthenticated
             }
-          </script></code></pre>
-        </section>
-        <section data-auto-animate>
-          <h3>signedRequest.query.spec.js</h3>
-          <pre><code class="js" data-trim data-noescape data-line-numbers><script type="text/template">
-            import request from "supertest";
-            import { s3 } from "../../config/aws";
-            
-            jest.mock("consola").mock("../../apolloMiddleware/userContext");
-            
-            const queryData = {
-              query: `query Query($input: SignedUrlInput!) {
-                generateUrl(input: $input) {
-                  success
-                  errors
-                  signedUrl
-                }
-              }  
-              `,
-              variables: {
-                input: {
-                  fileType: "image/jpeg",
-                },
-              },
-            };
-            
-            describe("SignedUrl resolver", () => {
-              it("generateUrl should return a signedUrl", async () => {
-                const spy = jest.spyOn(s3, "getSignedUrl").mockImplementation(() => "signed-url");
-            
-                const response = await request(global.app).post("/graphql").send(queryData);
-                expect(spy).toHaveBeenCalled();
-                expect(response.status).toBe(200);
-                expect(response.body.data.generateUrl.success).toBeTruthy();
-                expect(response.body.data.generateUrl.errors).toHaveLength(0);
-                expect(response.body.data.generateUrl.signedUrl).toBe("signed-url");
-            
-                spy.mockRestore();
-              });
-            
-              it("should throw an error", async () => {
-                const spy = jest.spyOn(s3, "getSignedUrl").mockImplementation(() => {
-                  throw new Error("nay");
-                });
-            
-                const response = await request(global.app).post("/graphql").send(queryData);
-                expect(response.body.data.generateUrl.errors).toHaveLength(1);
-                expect(response.body.data.generateUrl.errors[0]).toBe("nay");
-                expect(response.status).toBe(200);
-                spy.mockRestore();
-              });
-            });                       
           </script></code></pre>
         </section>
         <section data-auto-animate>
           <h3>signedRequest.resolver.js</h3>
           <pre><code class="js" data-trim data-noescape data-line-numbers><script type="text/template">
-            import { s3 } from "../config/aws";
+            import { S3Client } from "../config/aws";
+            import { PutObjectCommand } from "@aws-sdk/client-s3";
+            import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
             import { v4 as uuid } from "uuid";
 
             const StoryResolver = {
               Query: {
                 generateUrl: async (parent, { input }, context, info) => {
-                  try {
-                    const signedUrl = s3.getSignedUrl("putObject", {
-                      Key: `${uuid()}.${input.fileType.split("/")[1]}`,
-                      Bucket: "hft-crap-stories",
-                      Expires: 3600,
-                    });
+                  const key = `${uuid()}.${fileType.split("/")[1]}`;
 
-                    return {
-                      success: true,
-                      errors: [],
-                      signedUrl: signedUrl,
-                    };
-                  } catch (err) {
-                    return {
-                      success: false,
-                      errors: [err.message ? err.message : err],
-                      signedUrl: null,
-                    };
-                  }
+                  const command = new PutObjectCommand({
+                    Bucket: "crap-stories-2024",
+                    Key: key,
+                  });
+
+                  const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+
+                  return signedUrl;
                 },
               },
             };
 
             export default StoryResolver;
+
           </script></code></pre>
         </section>
       </section>
@@ -787,23 +711,6 @@
         <section data-auto-animate data-background-size="cover"
           data-background-image="https://media.giphy.com/media/xTk9ZvMnbIiIew7IpW/giphy.gif">
           <h3 class="title">Frontend upload</h3>
-        </section>
-        <section data-auto-animate>
-          <h3>mockRequests.js</h3>
-          <pre><code class="js" data-trim data-noescape data-line-numbers><script type="text/template">
-          const signedUrlHandlers = [
-            graphql.query("SignedUrlQuery", (req, res, ctx) =>
-              res(
-                ctx.data({
-                  generateUrl: { signedUrl: "signed-url", success: true, errors: null },
-                })
-              )
-            ),
-            rest.put(`signed-url`, (req, res, ctx) => {
-              return res(ctx.json({ msg: "ok" }));
-            }),
-          ];
-          </script></code></pre>
         </section>
         <section data-auto-animate>
           <h3>React custom hook module pattern</h3>
@@ -820,7 +727,7 @@
             import HomeFormFields from "./components/HomeFormFields";
             import { useNavigate } from "react-router-dom";
             import { RouteName } from "../../routes/routesnames";
-            import useStoryCreate from "./components/useStoryCreate";
+            import useStoryCreate from "./hooks/useStoryCreate";
             
             export default function HomeCreateView() {
               const navigate = useNavigate();
@@ -850,68 +757,6 @@
           </script></code></pre>
         </section>
         <section data-auto-animate>
-          <h3>HomeCreateView.spec.js</h3>
-          <pre><code class="jsx" data-trim data-noescape data-line-numbers="5,7,11-14"><script type="text/template">
-            import { render, screen } from "@testing-library/react";
-            import userEvent from "@testing-library/user-event";
-            import { AllProviders } from "../../../testUtils";
-            import HomeCreateView from "../HomeCreateView";
-            import useStoryCreate from "../components/useStoryCreate";
-
-            jest.mock("async-validator").mock("../components/useStoryCreate");
-
-            describe("HomeCreateView", () => {
-              it("should show a success message", async () => {
-                useStoryCreate.mockReturnValue({
-                  operations: { handleCreate: () => Promise.resolve() },
-                  state: { isUploading: false },
-                });
-
-                render(
-                  <AllProviders>
-                    <HomeCreateView />
-                  </AllProviders>
-                );
-
-                const fileInput = await screen.findByTestId("drop");
-                const file = new File(["(⌐□_□)"], "chucknorris.png", { type: ".png" });
-                await userEvent.upload(fileInput, file);
-                const titleField = await screen.findByLabelText("Title");
-                const submitButton = await screen.findByRole("button", {
-                  name: /Add this story/i,
-                });
-
-                userEvent.type(titleField, "sth");
-                userEvent.click(submitButton);
-
-                const text = await screen.findByText(/Story created!/i);
-                expect(text).toBeInTheDocument();
-              });
-            });
-          </script></code></pre>
-        </section>
-        <section data-auto-animate>
-          <h3>useStoryCreate.spec.js</h3>
-          <pre><code class="jsx" data-trim data-noescape data-line-numbers><script type="text/template">
-            describe("useStoryCreate", () => {
-              it("should do it", async () => {
-                const wrapper = ({ children }) => <AllProviders>{children}</AllProviders>;
-                const { result } = renderHook(() => useStoryCreate(), { wrapper });
-                const values = {
-                  title: "teststory",
-                  thumbnail: new File(["(⌐□_□)"], "chucknorris.png", { type: ".png" }),
-                };
-            
-                await act(async () => {
-                  await expect(
-                    result.current.operations.handleCreate(values)
-                  ).resolves.toBeUndefined();
-                });
-              });            
-            });
-          </script></code></pre>
-        </section>
-        <section data-auto-animate>
           <h3>useStoryCreate.js</h3>
           <pre><code class="jsx" data-trim data-noescape data-line-numbers><script type="text/template">
             import { useState } from "react";
@@ -926,25 +771,31 @@
 
               const handleCreate = async (values) => {
                 setIsUploading(true);
-                const { data } = await signedUrl({
+                const { data, error } = await signedUrl({
                   variables: { input: { fileType: values.thumbnail.type } },
                 });
-
-                if (!data.generateUrl.success) {
+            
+                if (error) {
                   throw new Error(data.errors);
                 }
-
-                await fetch(data.generateUrl.signedUrl, {
-                  method: "put",
-                  "Content-Type": values.thumbnail.type,
+            
+                const response = await fetch(data.generateUrl, {
+                  method: "PUT",
                   body: values.thumbnail,
+                  headers: {
+                    "Content-Type": values.thumbnail.type,
+                  },
                 });
-
+            
+                if (!response.ok) {
+                  throw new Error("Could not upload file");
+                }
+            
                 await createStory({
                   variables: {
                     input: {
                       title: values.title,
-                      imageUrl: data.generateUrl.signedUrl.split("?")[0],
+                      imageUrl: data.generateUrl.split("?")[0],
                     },
                   },
                 });
